@@ -11,7 +11,7 @@ use bootloader_x86_64_common::{
 use core::{
     cell::UnsafeCell,
     ops::{Deref, DerefMut},
-    ptr, slice,
+    slice,
 };
 use uefi::{
     CStr8, CStr16,
@@ -40,6 +40,7 @@ use x86_64::{
 };
 
 mod memory_descriptor;
+mod direct_disk;
 
 static SYSTEM_TABLE: RacyCell<Option<SystemTable<Boot>>> = RacyCell::new(None);
 
@@ -189,7 +190,13 @@ fn load_ramdisk(
     st: &mut SystemTable<Boot>,
     boot_mode: BootMode,
 ) -> Option<&'static mut [u8]> {
-    load_file_from_boot_method(image, st, "ramdisk\0", boot_mode)
+    match boot_mode {
+        BootMode::Disk => {
+            direct_disk::load_root_file(image, st, "ramdisk")
+                .or_else(|| load_file_from_disk("ramdisk\0", image, st))
+        }
+        BootMode::Tftp => load_file_from_tftp_boot_server("ramdisk\0", image, st),
+    }
 }
 
 fn load_config_file(
@@ -302,6 +309,8 @@ fn load_file_from_disk(
     image: Handle,
     st: &SystemTable<Boot>,
 ) -> Option<&'static mut [u8]> {
+    const DISK_READ_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
     let mut file_system_raw = locate_and_open_protocol::<SimpleFileSystem>(image, st)?;
     let file_system = file_system_raw.deref_mut();
 
@@ -332,9 +341,15 @@ fn load_file_from_disk(
             ((file_size - 1) / 4096) + 1,
         )
         .unwrap() as *mut u8;
-    unsafe { ptr::write_bytes(file_ptr, 0, file_size) };
     let file_slice = unsafe { slice::from_raw_parts_mut(file_ptr, file_size) };
-    file.read(file_slice).unwrap();
+
+    let mut bytes_read = 0;
+    while bytes_read < file_slice.len() {
+        let chunk_end = usize::min(bytes_read + DISK_READ_CHUNK_SIZE, file_slice.len());
+        let read = file.read(&mut file_slice[bytes_read..chunk_end]).unwrap();
+        assert_ne!(read, 0, "Unexpected EOF while reading `{name}`");
+        bytes_read += read;
+    }
 
     Some(file_slice)
 }
