@@ -9,6 +9,7 @@ use bootloader_x86_64_common::{
     Kernel, RawFrameBufferInfo, SystemInfo, legacy_memory_region::LegacyFrameAllocator,
 };
 use core::{
+    arch::x86_64::{__cpuid, _rdtsc},
     cell::UnsafeCell,
     ops::{Deref, DerefMut},
     slice,
@@ -39,8 +40,8 @@ use x86_64::{
     structures::paging::{FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB},
 };
 
-mod memory_descriptor;
 mod direct_disk;
+mod memory_descriptor;
 
 static SYSTEM_TABLE: RacyCell<Option<SystemTable<Boot>>> = RacyCell::new(None);
 
@@ -62,6 +63,219 @@ impl<T> core::ops::Deref for RacyCell<T> {
     }
 }
 
+const PROFILE_STAGE_CAPACITY: usize = 16;
+
+#[derive(Clone, Copy)]
+struct StageRecord {
+    label: &'static str,
+    cycles: u64,
+    since_boot_cycles: u64,
+    bytes: Option<u64>,
+}
+
+struct StageProfiler {
+    boot_start: u64,
+    stage_start: u64,
+    tsc_hz: Option<u64>,
+    clock_logged: bool,
+    records: [Option<StageRecord>; PROFILE_STAGE_CAPACITY],
+    len: usize,
+    flushed: usize,
+}
+
+impl StageProfiler {
+    fn new(st: &SystemTable<Boot>) -> Self {
+        let tsc_hz = estimate_tsc_hz().or_else(|| calibrate_tsc_hz(st));
+        let now = read_tsc();
+        Self {
+            boot_start: now,
+            stage_start: now,
+            tsc_hz,
+            clock_logged: false,
+            records: [None; PROFILE_STAGE_CAPACITY],
+            len: 0,
+            flushed: 0,
+        }
+    }
+
+    fn finish_stage(&mut self, label: &'static str) {
+        self.finish_stage_with_bytes(label, None);
+    }
+
+    fn finish_stage_with_bytes(&mut self, label: &'static str, bytes: Option<usize>) {
+        let now = read_tsc();
+        let record = StageRecord {
+            label,
+            cycles: now.saturating_sub(self.stage_start),
+            since_boot_cycles: now.saturating_sub(self.boot_start),
+            bytes: bytes.and_then(|bytes| u64::try_from(bytes).ok()),
+        };
+
+        if self.len < self.records.len() {
+            self.records[self.len] = Some(record);
+            self.len += 1;
+        }
+
+        self.stage_start = now;
+    }
+
+    fn flush(&mut self) {
+        if !self.clock_logged {
+            match self.tsc_hz {
+                Some(tsc_hz) => {
+                    log::info!("profile: TSC frequency estimate {} MHz", tsc_hz / 1_000_000)
+                }
+                None => {
+                    log::warn!("profile: TSC frequency estimate unavailable, reporting cycles only")
+                }
+            }
+            self.clock_logged = true;
+        }
+
+        while self.flushed < self.len {
+            let record = self.records[self.flushed].expect("profile record missing");
+            self.log_record(record);
+            self.flushed += 1;
+        }
+    }
+
+    fn log_total(&self, label: &'static str) {
+        let total_cycles = read_tsc().saturating_sub(self.boot_start);
+        if let Some(tsc_hz) = self.tsc_hz {
+            let total_micros = cycles_to_micros(total_cycles, tsc_hz);
+            log::info!(
+                "profile: {label} total={}.{:03} ms ({} cycles)",
+                total_micros / 1000,
+                total_micros % 1000,
+                total_cycles
+            );
+        } else {
+            log::info!("profile: {label} total={total_cycles} cycles");
+        }
+    }
+
+    fn log_record(&self, record: StageRecord) {
+        if let Some(tsc_hz) = self.tsc_hz {
+            let stage_micros = cycles_to_micros(record.cycles, tsc_hz);
+            let boot_micros = cycles_to_micros(record.since_boot_cycles, tsc_hz);
+            match (
+                record.bytes,
+                bytes_per_second(record.bytes, record.cycles, tsc_hz),
+            ) {
+                (Some(bytes), Some(bytes_per_second)) => log::info!(
+                    "profile: {} took {}.{:03} ms (boot {}.{:03} ms, {} bytes, {} MiB/s)",
+                    record.label,
+                    stage_micros / 1000,
+                    stage_micros % 1000,
+                    boot_micros / 1000,
+                    boot_micros % 1000,
+                    bytes,
+                    bytes_per_second / (1024 * 1024)
+                ),
+                (Some(bytes), None) => log::info!(
+                    "profile: {} took {}.{:03} ms (boot {}.{:03} ms, {} bytes)",
+                    record.label,
+                    stage_micros / 1000,
+                    stage_micros % 1000,
+                    boot_micros / 1000,
+                    boot_micros % 1000,
+                    bytes
+                ),
+                (None, _) => log::info!(
+                    "profile: {} took {}.{:03} ms (boot {}.{:03} ms)",
+                    record.label,
+                    stage_micros / 1000,
+                    stage_micros % 1000,
+                    boot_micros / 1000,
+                    boot_micros % 1000
+                ),
+            }
+        } else if let Some(bytes) = record.bytes {
+            log::info!(
+                "profile: {} took {} cycles (boot {} cycles, {} bytes)",
+                record.label,
+                record.cycles,
+                record.since_boot_cycles,
+                bytes
+            );
+        } else {
+            log::info!(
+                "profile: {} took {} cycles (boot {} cycles)",
+                record.label,
+                record.cycles,
+                record.since_boot_cycles
+            );
+        }
+    }
+}
+
+fn read_tsc() -> u64 {
+    unsafe { _rdtsc() }
+}
+
+fn estimate_tsc_hz() -> Option<u64> {
+    let max_basic_leaf = __cpuid(0).eax;
+
+    if max_basic_leaf >= 0x15 {
+        let leaf = __cpuid(0x15);
+        if leaf.eax != 0 && leaf.ebx != 0 && leaf.ecx != 0 {
+            return Some(
+                u64::from(leaf.ecx)
+                    .checked_mul(u64::from(leaf.ebx))?
+                    .checked_div(u64::from(leaf.eax))?,
+            );
+        }
+    }
+
+    if max_basic_leaf >= 0x16 {
+        let leaf = __cpuid(0x16);
+        if leaf.eax != 0 {
+            return Some(u64::from(leaf.eax) * 1_000_000);
+        }
+    }
+
+    None
+}
+
+fn calibrate_tsc_hz(st: &SystemTable<Boot>) -> Option<u64> {
+    const CALIBRATION_DELAY_US: usize = 10_000;
+
+    let start = read_tsc();
+    st.boot_services().stall(CALIBRATION_DELAY_US);
+    let end = read_tsc();
+    let cycles = end.checked_sub(start)?;
+    if cycles == 0 {
+        return None;
+    }
+
+    Some(((u128::from(cycles) * 1_000_000) / CALIBRATION_DELAY_US as u128) as u64)
+}
+
+fn cycles_to_micros(cycles: u64, tsc_hz: u64) -> u64 {
+    ((u128::from(cycles) * 1_000_000) / u128::from(tsc_hz)) as u64
+}
+
+fn bytes_per_second(bytes: Option<u64>, cycles: u64, tsc_hz: u64) -> Option<u64> {
+    let bytes = bytes?;
+    if cycles == 0 {
+        return None;
+    }
+
+    Some(((u128::from(bytes) * u128::from(tsc_hz)) / u128::from(cycles)) as u64)
+}
+
+struct LoadedRamdisk {
+    bytes: &'static mut [u8],
+    source: RamdiskSource,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RamdiskSource {
+    DirectDisk,
+    UefiFile,
+    Tftp,
+}
+
 #[entry]
 fn efi_main(image: Handle, st: SystemTable<Boot>) -> Status {
     main_inner(image, st)
@@ -73,17 +287,27 @@ fn main_inner(image: Handle, mut st: SystemTable<Boot>) -> Status {
         *SYSTEM_TABLE.get() = Some(st.unsafe_clone());
     }
 
+    let mut profiler = StageProfiler::new(&st);
     let mut boot_mode = BootMode::Disk;
 
     let mut kernel = load_kernel(image, &mut st, boot_mode);
+    profiler.finish_stage_with_bytes("load_kernel_disk", kernel.as_ref().map(|(_, len)| *len));
     if kernel.is_none() {
         // Try TFTP boot
         boot_mode = BootMode::Tftp;
         kernel = load_kernel(image, &mut st, boot_mode);
+        profiler.finish_stage_with_bytes("load_kernel_tftp", kernel.as_ref().map(|(_, len)| *len));
     }
-    let kernel = kernel.expect("Failed to load kernel");
+    let (kernel, _) = kernel.expect("Failed to load kernel");
 
     let config_file = load_config_file(image, &mut st, boot_mode);
+    profiler.finish_stage_with_bytes(
+        match boot_mode {
+            BootMode::Disk => "load_config_disk",
+            BootMode::Tftp => "load_config_tftp",
+        },
+        config_file.as_ref().map(|config_file| config_file.len()),
+    );
     let mut error_loading_config: Option<serde_json_core::de::Error> = None;
     let mut config: BootConfig = match config_file
         .as_deref()
@@ -96,6 +320,7 @@ fn main_inner(image: Handle, mut st: SystemTable<Boot>) -> Status {
             Default::default()
         }
     };
+    profiler.finish_stage("parse_config");
 
     #[allow(deprecated)]
     if config.frame_buffer.minimum_framebuffer_height.is_none() {
@@ -108,12 +333,14 @@ fn main_inner(image: Handle, mut st: SystemTable<Boot>) -> Status {
             kernel.config.frame_buffer.minimum_framebuffer_width;
     }
     let framebuffer = init_logger(image, &st, &config);
+    profiler.finish_stage("init_logger");
 
     unsafe {
         *SYSTEM_TABLE.get() = None;
     }
 
     log::info!("UEFI bootloader started");
+    profiler.flush();
 
     if let Some(framebuffer) = framebuffer {
         log::info!("Using framebuffer at {:#x}", framebuffer.addr);
@@ -128,29 +355,47 @@ fn main_inner(image: Handle, mut st: SystemTable<Boot>) -> Status {
     log::info!("Trying to load ramdisk via {:?}", boot_mode);
     // Ramdisk must load from same source, or not at all.
     let ramdisk = load_ramdisk(image, &mut st, boot_mode);
-
-    log::info!(
-        "{}",
-        match ramdisk {
-            Some(_) => "Loaded ramdisk",
-            None => "Ramdisk not found.",
-        }
+    profiler.finish_stage_with_bytes(
+        match boot_mode {
+            BootMode::Disk => "load_ramdisk_disk",
+            BootMode::Tftp => "load_ramdisk_tftp",
+        },
+        ramdisk.as_ref().map(|ramdisk| ramdisk.bytes.len()),
     );
+    profiler.flush();
+
+    match ramdisk.as_ref() {
+        Some(ramdisk) => log::info!(
+            "Loaded ramdisk via {:?} ({} bytes)",
+            ramdisk.source,
+            ramdisk.bytes.len()
+        ),
+        None => log::info!("Ramdisk not found."),
+    }
 
     log::trace!("exiting boot services");
     let (system_table, mut memory_map) = st.exit_boot_services();
+    profiler.finish_stage("exit_boot_services");
+    profiler.flush();
 
     memory_map.sort();
+    profiler.finish_stage("sort_memory_map");
+    profiler.flush();
 
     let mut frame_allocator =
         LegacyFrameAllocator::new(memory_map.entries().copied().map(UefiMemoryDescriptor));
+    profiler.finish_stage("init_frame_allocator");
+    profiler.flush();
 
     let max_phys_addr = frame_allocator.max_phys_addr();
     let page_tables = create_page_tables(&mut frame_allocator, max_phys_addr, framebuffer.as_ref());
+    profiler.finish_stage("create_page_tables");
+    profiler.flush();
+
     let mut ramdisk_len = 0u64;
     let ramdisk_addr = if let Some(rd) = ramdisk {
-        ramdisk_len = rd.len() as u64;
-        Some(rd.as_ptr() as usize as u64)
+        ramdisk_len = rd.bytes.len() as u64;
+        Some(rd.bytes.as_ptr() as usize as u64)
     } else {
         None
     };
@@ -169,6 +414,9 @@ fn main_inner(image: Handle, mut st: SystemTable<Boot>) -> Status {
         ramdisk_addr,
         ramdisk_len,
     };
+    profiler.finish_stage("build_system_info");
+    profiler.flush();
+    profiler.log_total("boot_to_kernel");
 
     bootloader_x86_64_common::load_and_switch_to_kernel(
         kernel,
@@ -189,13 +437,25 @@ fn load_ramdisk(
     image: Handle,
     st: &mut SystemTable<Boot>,
     boot_mode: BootMode,
-) -> Option<&'static mut [u8]> {
+) -> Option<LoadedRamdisk> {
     match boot_mode {
-        BootMode::Disk => {
-            direct_disk::load_root_file(image, st, "ramdisk")
-                .or_else(|| load_file_from_disk("ramdisk\0", image, st))
+        BootMode::Disk => direct_disk::load_root_file(image, st, "ramdisk")
+            .map(|bytes| LoadedRamdisk {
+                bytes,
+                source: RamdiskSource::DirectDisk,
+            })
+            .or_else(|| {
+                load_file_from_disk("ramdisk\0", image, st).map(|bytes| LoadedRamdisk {
+                    bytes,
+                    source: RamdiskSource::UefiFile,
+                })
+            }),
+        BootMode::Tftp => {
+            load_file_from_tftp_boot_server("ramdisk\0", image, st).map(|bytes| LoadedRamdisk {
+                bytes,
+                source: RamdiskSource::Tftp,
+            })
         }
-        BootMode::Tftp => load_file_from_tftp_boot_server("ramdisk\0", image, st),
     }
 }
 
@@ -211,9 +471,10 @@ fn load_kernel(
     image: Handle,
     st: &mut SystemTable<Boot>,
     boot_mode: BootMode,
-) -> Option<Kernel<'static>> {
+) -> Option<(Kernel<'static>, usize)> {
     let kernel_slice = load_file_from_boot_method(image, st, "kernel-x86_64\0", boot_mode)?;
-    Some(Kernel::parse(kernel_slice))
+    let kernel_len = kernel_slice.len();
+    Some((Kernel::parse(kernel_slice), kernel_len))
 }
 
 fn load_file_from_boot_method(
@@ -231,7 +492,7 @@ fn load_file_from_boot_method(
 fn open_device_path_protocol(
     image: Handle,
     st: &SystemTable<Boot>,
-) -> Option<ScopedProtocol<DevicePath>> {
+) -> Option<ScopedProtocol<'_, DevicePath>> {
     let this = st.boot_services();
     let loaded_image = unsafe {
         this.open_protocol::<LoadedImage>(
@@ -273,7 +534,7 @@ fn open_device_path_protocol(
 fn locate_and_open_protocol<P: ProtocolPointer>(
     image: Handle,
     st: &SystemTable<Boot>,
-) -> Option<ScopedProtocol<P>> {
+) -> Option<ScopedProtocol<'_, P>> {
     let this = st.boot_services();
     let device_path = open_device_path_protocol(image, st)?;
     let mut device_path = device_path.deref();

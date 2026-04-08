@@ -11,6 +11,8 @@ pub fn create_fat_filesystem(
     out_fat_path: &Path,
 ) -> anyhow::Result<()> {
     const MB: u64 = 1024 * 1024;
+    const INITIAL_PADDING: u64 = 4 * MB;
+    const MAX_ATTEMPTS: usize = 8;
 
     // calculate needed size
     let mut needed_size = 0;
@@ -18,16 +20,7 @@ pub fn create_fat_filesystem(
         needed_size += source.len()?;
     }
 
-    // create new filesystem image file at the given path and set its length
-    let fat_file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(out_fat_path)
-        .unwrap();
-    let fat_size_padded_and_rounded = ((needed_size + 1024 * 64 - 1) / MB + 1) * MB + MB;
-    fat_file.set_len(fat_size_padded_and_rounded).unwrap();
+    let mut fat_size = round_up_to_mib(needed_size.saturating_add(INITIAL_PADDING));
 
     // choose a file system label
     let mut label = *b"MY_RUST_OS!";
@@ -45,15 +38,19 @@ pub fn create_fat_filesystem(
         }
     }
 
-    // format the file system and open it
-    let format_options = fatfs::FormatVolumeOptions::new().volume_label(label);
-    fatfs::format_volume(&fat_file, format_options).context("Failed to format FAT file")?;
-    let filesystem = fatfs::FileSystem::new(&fat_file, fatfs::FsOptions::new())
-        .context("Failed to open FAT file system of UEFI FAT file")?;
-    let root_dir = filesystem.root_dir();
+    for _ in 0..MAX_ATTEMPTS {
+        match format_and_copy_files(fat_size, label, &files, out_fat_path) {
+            Ok(()) => return Ok(()),
+            Err(err) if is_no_space_error(&err) => {
+                fat_size = fat_size.saturating_mul(2);
+            }
+            Err(err) => return Err(err),
+        }
+    }
 
-    // copy files to file system
-    add_files_to_image(&root_dir, files)
+    Err(anyhow::anyhow!(
+        "failed to create FAT filesystem image after {MAX_ATTEMPTS} attempts"
+    ))
 }
 
 pub fn add_files_to_image(
@@ -90,4 +87,71 @@ pub fn add_files_to_image(
     }
 
     Ok(())
+}
+
+fn format_and_copy_files(
+    fat_size: u64,
+    label: [u8; 11],
+    files: &BTreeMap<&str, &FileDataSource>,
+    out_fat_path: &Path,
+) -> anyhow::Result<()> {
+    let fat_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(out_fat_path)
+        .with_context(|| format!("failed to create FAT image at `{}`", out_fat_path.display()))?;
+    fat_file
+        .set_len(fat_size)
+        .with_context(|| format!("failed to resize FAT image at `{}`", out_fat_path.display()))?;
+
+    let format_options = fatfs::FormatVolumeOptions::new().volume_label(label);
+    fatfs::format_volume(&fat_file, format_options).context("Failed to format FAT file")?;
+    let filesystem = fatfs::FileSystem::new(&fat_file, fatfs::FsOptions::new())
+        .context("Failed to open FAT file system of UEFI FAT file")?;
+    let root_dir = filesystem.root_dir();
+
+    add_files_to_image(&root_dir, files.clone())
+}
+
+fn round_up_to_mib(bytes: u64) -> u64 {
+    const MB: u64 = 1024 * 1024;
+    bytes.saturating_add(MB - 1) / MB * MB
+}
+
+fn is_no_space_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string().contains("No space left on device"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_fat_filesystem;
+    use crate::file_data_source::FileDataSource;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn creates_filesystem_for_large_ramdisk() {
+        let ramdisk = NamedTempFile::new().unwrap();
+        ramdisk.as_file().set_len(512 * 1024 * 1024).unwrap();
+
+        let out_fat = NamedTempFile::new().unwrap();
+        let ramdisk_source = FileDataSource::File(ramdisk.path().to_path_buf());
+        let mut files = BTreeMap::new();
+        files.insert("ramdisk", &ramdisk_source);
+
+        create_fat_filesystem(files, out_fat.path()).unwrap();
+
+        let fat_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(out_fat.path())
+            .unwrap();
+        let fs = fatfs::FileSystem::new(&fat_file, fatfs::FsOptions::new()).unwrap();
+        let stats = fs.stats().unwrap();
+        assert!(stats.free_clusters() > 0);
+    }
 }

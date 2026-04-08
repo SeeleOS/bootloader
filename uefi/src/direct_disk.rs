@@ -1,16 +1,16 @@
 use core::{cmp, ops::Deref, ptr::NonNull, slice};
 use uefi::{
+    Handle,
     prelude::{Boot, SystemTable},
     proto::{
+        ProtocolPointer,
         device_path::DevicePath,
         loaded_image::LoadedImage,
         media::block::{BlockIO, BlockIOMedia},
-        ProtocolPointer,
     },
     table::boot::{
         AllocateType, MemoryType, OpenProtocolAttributes, OpenProtocolParams, ScopedProtocol,
     },
-    Handle,
 };
 
 const DIRECTORY_ENTRY_BYTES: usize = 32;
@@ -20,8 +20,9 @@ const LONG_NAME_ENTRY_ORDER_LAST: u8 = 0x40;
 const LONG_NAME_ENTRY_ORDER_MASK: u8 = 0x1F;
 const LONG_NAME_CHARS_PER_ENTRY: usize = 13;
 const MAX_LONG_NAME_LEN: usize = 260;
-const DEFAULT_TRANSFER_BLOCKS: usize = 64;
-const MAX_TRANSFER_BLOCKS: usize = 512;
+const DEFAULT_CACHE_BLOCKS: usize = 64;
+const MAX_CACHE_BLOCKS: usize = 512;
+const DIRECT_READ_TARGET_BYTES: usize = 8 * 1024 * 1024;
 const PAGE_SIZE: usize = 4096;
 
 pub fn load_root_file(
@@ -51,7 +52,19 @@ fn try_load_root_file(
 
     let file_len = usize::try_from(file.file_size).map_err(|_| ())?;
     let file_slice = allocate_loader_data_aligned(st, file_len, fs.required_alignment());
-    fs.read_file(&file, file_slice)?;
+    let stats = fs.read_file(&file, file_slice)?;
+    log::info!(
+        "Direct disk load `{name}`: {} bytes in {} extent(s), block_size={} io_align={} cache={} KiB direct_chunk={} KiB",
+        file_len,
+        stats.extents,
+        fs.reader.block_size,
+        fs.reader.io_align,
+        fs.reader.cache.len() / 1024,
+        fs.reader
+            .max_direct_blocks
+            .saturating_mul(fs.reader.block_size)
+            / 1024
+    );
     Ok(Some(file_slice))
 }
 
@@ -201,14 +214,15 @@ impl<'a> DirectFatFs<'a> {
         }
     }
 
-    fn read_file(&mut self, file: &File, out: &mut [u8]) -> Result<(), ()> {
+    fn read_file(&mut self, file: &File, out: &mut [u8]) -> Result<FileReadStats, ()> {
         if out.is_empty() {
-            return Ok(());
+            return Ok(FileReadStats { extents: 0 });
         }
 
         let bytes_per_cluster = usize::try_from(self.bpb.bytes_per_cluster()).map_err(|_| ())?;
         let mut current_cluster = file.first_cluster;
         let mut written = 0usize;
+        let mut extents = 0usize;
 
         while written < out.len() {
             let cluster = self.cluster_from_entry(current_cluster)?;
@@ -238,6 +252,7 @@ impl<'a> DirectFatFs<'a> {
                 cluster.start_offset,
                 &mut out[written..written + extent_len],
             )?;
+            extents += 1;
             written += extent_len;
 
             if written == out.len() {
@@ -248,7 +263,7 @@ impl<'a> DirectFatFs<'a> {
         }
 
         if written == out.len() {
-            Ok(())
+            Ok(FileReadStats { extents })
         } else {
             Err(())
         }
@@ -292,7 +307,9 @@ struct BlockReader<'a> {
     media_id: u32,
     block_size: usize,
     io_align: usize,
-    transfer_blocks: usize,
+    cache_blocks: usize,
+    optimal_transfer_blocks: usize,
+    max_direct_blocks: usize,
     last_block_plus_one: u64,
     cache: &'static mut [u8],
     cached_lba: Option<u64>,
@@ -302,7 +319,15 @@ struct BlockReader<'a> {
 impl<'a> BlockReader<'a> {
     fn new(image: Handle, st: &'a SystemTable<Boot>) -> Option<Self> {
         let block = open_boot_device_protocol::<BlockIO>(image, st)?;
-        let (media_id, block_size, io_align, transfer_blocks, last_block_plus_one) = {
+        let (
+            media_id,
+            block_size,
+            io_align,
+            cache_blocks,
+            optimal_transfer_blocks,
+            max_direct_blocks,
+            last_block_plus_one,
+        ) = {
             let media = block.media();
             let block_size = usize::try_from(media.block_size()).ok()?;
             if block_size == 0 {
@@ -313,17 +338,20 @@ impl<'a> BlockReader<'a> {
                 0 | 1 => 1,
                 align => align,
             };
+            let optimal_transfer_blocks = optimal_transfer_blocks(media);
 
             (
                 media.media_id(),
                 block_size,
                 io_align,
-                preferred_transfer_blocks(media),
+                cache_blocks(optimal_transfer_blocks),
+                optimal_transfer_blocks,
+                max_direct_blocks(block_size, optimal_transfer_blocks),
                 media.last_block().checked_add(1)?,
             )
         };
 
-        let cache_len = block_size.checked_mul(transfer_blocks)?;
+        let cache_len = block_size.checked_mul(cache_blocks)?;
         let cache = allocate_loader_data_aligned(st, cache_len, io_align.max(PAGE_SIZE));
 
         Some(Self {
@@ -331,7 +359,9 @@ impl<'a> BlockReader<'a> {
             media_id,
             block_size,
             io_align,
-            transfer_blocks,
+            cache_blocks,
+            optimal_transfer_blocks,
+            max_direct_blocks,
             last_block_plus_one,
             cache,
             cached_lba: None,
@@ -393,11 +423,14 @@ impl<'a> BlockReader<'a> {
 
         let whole_blocks = buffer.len() / self.block_size;
         let mut read_blocks = cmp::min(
-            cmp::min(whole_blocks, self.transfer_blocks),
+            cmp::min(whole_blocks, self.max_direct_blocks),
             remaining_blocks,
         );
         if read_blocks < whole_blocks {
-            let align_blocks = self.required_direct_block_multiple();
+            let align_blocks = lcm(
+                self.required_direct_block_multiple(),
+                self.optimal_transfer_blocks,
+            );
             if align_blocks > 1 {
                 read_blocks -= read_blocks % align_blocks;
             }
@@ -421,12 +454,12 @@ impl<'a> BlockReader<'a> {
             }
         }
 
-        let transfer_blocks = u64::try_from(self.transfer_blocks).map_err(|_| ())?;
-        let window_lba = (target_lba / transfer_blocks)
-            .checked_mul(transfer_blocks)
+        let cache_blocks = u64::try_from(self.cache_blocks).map_err(|_| ())?;
+        let window_lba = (target_lba / cache_blocks)
+            .checked_mul(cache_blocks)
             .ok_or(())?;
         let remaining_blocks = self.last_block_plus_one.checked_sub(window_lba).ok_or(())?;
-        let blocks_to_read = cmp::min(remaining_blocks, transfer_blocks);
+        let blocks_to_read = cmp::min(remaining_blocks, cache_blocks);
         if blocks_to_read == 0 {
             return Err(());
         }
@@ -453,13 +486,46 @@ impl<'a> BlockReader<'a> {
     }
 }
 
-fn preferred_transfer_blocks(media: &BlockIOMedia) -> usize {
+fn optimal_transfer_blocks(media: &BlockIOMedia) -> usize {
     let granularity = usize::try_from(media.optimal_transfer_length_granularity()).unwrap_or(0);
-    if granularity == 0 {
-        DEFAULT_TRANSFER_BLOCKS
+    if granularity == 0 { 1 } else { granularity }
+}
+
+fn cache_blocks(optimal_transfer_blocks: usize) -> usize {
+    if optimal_transfer_blocks == 1 {
+        DEFAULT_CACHE_BLOCKS
     } else {
-        granularity.min(MAX_TRANSFER_BLOCKS)
+        optimal_transfer_blocks.min(MAX_CACHE_BLOCKS)
     }
+}
+
+fn max_direct_blocks(block_size: usize, optimal_transfer_blocks: usize) -> usize {
+    let target_blocks = DIRECT_READ_TARGET_BYTES.div_ceil(block_size);
+    round_up(
+        target_blocks.max(optimal_transfer_blocks),
+        optimal_transfer_blocks,
+    )
+}
+
+fn round_up(value: usize, multiple: usize) -> usize {
+    if multiple <= 1 {
+        value
+    } else {
+        value.div_ceil(multiple) * multiple
+    }
+}
+
+fn lcm(left: usize, right: usize) -> usize {
+    left / gcd(left, right) * right
+}
+
+fn gcd(mut left: usize, mut right: usize) -> usize {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left.max(1)
 }
 
 fn open_boot_device_protocol<P: ProtocolPointer + ?Sized>(
@@ -518,6 +584,11 @@ struct File {
     first_cluster: u32,
     file_size: u32,
     attributes: u8,
+}
+
+#[derive(Clone, Copy)]
+struct FileReadStats {
+    extents: usize,
 }
 
 #[derive(Clone, Copy)]
