@@ -1,7 +1,7 @@
 use crate::{framebuffer::FrameBufferWriter, serial::SerialPort};
 use bootloader_api::info::FrameBufferInfo;
 use conquer_once::spin::OnceCell;
-use core::fmt::Write;
+use core::fmt::{self, Write};
 use spinning_top::Spinlock;
 
 /// The global logger instance used for the `log` crate.
@@ -59,13 +59,39 @@ impl log::Log for LockedLogger {
     fn log(&self, record: &log::Record) {
         if let Some(framebuffer) = &self.framebuffer {
             let mut framebuffer = framebuffer.lock();
-            writeln!(framebuffer, "{:5}: {}", record.level(), record.args()).unwrap();
+            write_terminal_record(&mut *framebuffer, record).unwrap();
         }
         if let Some(serial) = &self.serial {
             let mut serial = serial.lock();
-            writeln!(serial, "{:5}: {}", record.level(), record.args()).unwrap();
+            write_serial_record(&mut *serial, record).unwrap();
         }
     }
 
     fn flush(&self) {}
+}
+
+fn write_terminal_record(writer: &mut impl Write, record: &log::Record) -> fmt::Result {
+    match record.level() {
+        log::Level::Error => writeln!(
+            writer,
+            "\x1b[1;97;41m Error \x1b[0m \x1b[1;31m{}\x1b[0m",
+            record.args()
+        ),
+        log::Level::Warn => writeln!(
+            writer,
+            "\x1b[1;97;43m  Warn \x1b[0m \x1b[1;33m{}\x1b[0m",
+            record.args()
+        ),
+        log::Level::Info => writeln!(writer, "\x1b[1;97;104m  Info \x1b[0m {}", record.args()),
+        log::Level::Debug => writeln!(writer, "\x1b[1;97;100m Debug \x1b[0m {}", record.args()),
+        log::Level::Trace => writeln!(
+            writer,
+            "\x1b[97;100m Trace \x1b[0m \x1b[90m{}\x1b[0m",
+            record.args()
+        ),
+    }
+}
+
+fn write_serial_record(writer: &mut impl Write, record: &log::Record) -> fmt::Result {
+    writeln!(writer, "{:5}: {}", record.level(), record.args())
 }

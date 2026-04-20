@@ -2,6 +2,8 @@
 #![feature(step_trait)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+extern crate alloc;
+
 use crate::legacy_memory_region::{LegacyFrameAllocator, LegacyMemoryRegion};
 use bootloader_api::{
     BootInfo, BootloaderConfig,
